@@ -25,18 +25,21 @@ policy, hooks, and lifecycle controls on top.
 """
 
 import os
+import sys
 import subprocess
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+# 将项目根目录加入 sys.path，以便导入 llm 模块
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+from llm.venus_client import VenusClient
+
+# 使用公司免费的 Venus API
+client = VenusClient()
+MODEL = client.model
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
@@ -67,7 +70,7 @@ def run_bash(command: str) -> str:
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
+        response = client.create_message(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
@@ -89,15 +92,21 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+
+    # 历史信息
     history = []
+
     while True:
         try:
             query = input("\033[36ms01 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
-        if query.strip().lower() in ("q", "exit", ""):
+        if query.strip().lower() in ("q", "exit", "", "quit"):
             break
         history.append({"role": "user", "content": query})
+        print(history)
+
+        # 调用agent
         agent_loop(history)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
