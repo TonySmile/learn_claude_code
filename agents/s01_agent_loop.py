@@ -26,31 +26,35 @@ policy, hooks, and lifecycle controls on top.
 
 import os
 import sys
+import json
 import subprocess
 
+import requests
 from dotenv import load_dotenv
+
+from rich import print
 
 load_dotenv(override=True)
 
 # 将项目根目录加入 sys.path，以便导入 llm 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from llm.venus_client import VenusClient
-
-# 使用公司免费的 Venus API
-client = VenusClient()
-MODEL = client.model
+from llm.venus_client import VENUS_CONFIG
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
+# OpenAI 格式的工具定义
 TOOLS = [{
-    "name": "bash",
-    "description": "Run a shell command.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"],
-    },
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    }
 }]
 
 
@@ -67,50 +71,111 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 
-# -- The core pattern: a while loop that calls tools until the model stops --
+def call_venus_with_tools(messages, tools=None):
+    """
+    调用 Venus API（OpenAI 格式），支持工具调用。
+    返回完整的 response message 字典。
+    """
+    cfg = VENUS_CONFIG
+    url = cfg['model_url']
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f"{cfg['auth_type']} {cfg['api_key']}",
+    }
+    body = {
+        'model': cfg['model_name'],
+        'messages': messages,
+        'temperature': cfg['temperature'],
+    }
+    if tools:
+        body['tools'] = tools
+
+    for attempt in range(cfg.get('max_retries', 3)):
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=cfg.get('timeout', 3600))
+            if resp.status_code == 200:
+                data = resp.json()
+                choice = data['choices'][0]
+                return choice['message'], choice.get('finish_reason', 'stop')
+            else:
+                print(f"[Venus] HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"[Venus] 请求异常: {e}")
+
+    return None, 'error'
+
+
+# -- 核心模式：一个 while 循环，不断调用工具直到模型停止 --
 def agent_loop(messages: list):
     while True:
-        response = client.create_message(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        # Append assistant turn
-        messages.append({"role": "assistant", "content": response.content})
-        # If the model didn't call a tool, we're done
-        if response.stop_reason != "tool_use":
+        # 构建带 system 消息的完整消息列表
+        full_messages = [{"role": "system", "content": SYSTEM}] + messages
+
+        # print('当前信息{}'.format(messages))
+        # print('历史信息{}'.format(full_messages))
+
+        assistant_msg, finish_reason = call_venus_with_tools(full_messages, TOOLS)
+
+        if assistant_msg is None:
+            print("\033[31m[Error] API 调用失败\033[0m")
             return
-        # Execute each tool call, collect results
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
+
+        # 将 assistant 回复加入历史
+        messages.append({"role": "assistant", "content": assistant_msg.get("content"),
+                         "tool_calls": assistant_msg.get("tool_calls")})
+
+        # 如果模型没有调用工具，结束循环
+        tool_calls = assistant_msg.get("tool_calls")
+        if not tool_calls:
+            return
+
+        # 执行每个工具调用，收集结果
+        for tool_call in tool_calls:
+            func = tool_call["function"]
+            func_name = func["name"]
+            try:
+                args = json.loads(func["arguments"])
+            except json.JSONDecodeError:
+                args = {"command": func["arguments"]}
+
+            if func_name == "bash":
+                command = args.get("command", "")  # 获取content里面的参数
+                print(f"\033[33m$ {command}\033[0m")
+                output = run_bash(command)  # 执行命令
                 print(output[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
-        messages.append({"role": "user", "content": results})
+            else:
+                output = f"Error: Unknown tool '{func_name}'"
+
+            # OpenAI 格式：tool 角色的消息
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": output,
+            })
 
 
 if __name__ == "__main__":
-
     # 历史信息
     history = []
 
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input("请输入你想说的内容：")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", "", "quit"):
             break
         history.append({"role": "user", "content": query})
+
+        # 调用 agent
+        agent_loop(history)
+
         print(history)
 
-        # 调用agent
-        agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        # 打印最后一条 assistant 回复
+        if history and history[-1].get("role") == "assistant":
+            content = history[-1].get("content")
+            if content:
+                print(content)
         print()
+
