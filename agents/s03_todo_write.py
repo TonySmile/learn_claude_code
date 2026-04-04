@@ -28,20 +28,24 @@ Key insight: "The agent can track its own progress -- and I can see it."
 """
 
 import os
+import sys
+import json
 import subprocess
 from pathlib import Path
 
-from anthropic import Anthropic
+import requests
 from dotenv import load_dotenv
+
+from rich import print
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+# 将项目根目录加入 sys.path，以便导入 llm 模块
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from llm.venus_client import VENUS_CONFIG
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
@@ -146,49 +150,120 @@ TOOL_HANDLERS = {
     "todo":       lambda **kw: TODO.update(kw["items"]),
 }
 
+# OpenAI 格式的工具定义
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
-     "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
+    {"type": "function", "function": {
+        "name": "bash", "description": "Run a shell command.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read file contents.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+
+    {"type": "function", "function": {
+        "name": "write_file", "description": "Write content to file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+
+    {"type": "function", "function": {
+        "name": "edit_file", "description": "Replace exact text in file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
+
+    {"type": "function", "function": {
+        "name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
+        "parameters": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}}},
 ]
+
+
+def call_venus_with_tools(messages, tools=None):
+    """
+    调用 Venus API（OpenAI 格式），支持工具调用。
+    返回完整的 response message 字典。
+    """
+    cfg = VENUS_CONFIG
+    url = cfg['model_url']
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f"{cfg['auth_type']} {cfg['api_key']}",
+    }
+    body = {
+        'model': cfg['model_name'],
+        'messages': messages,
+        'temperature': cfg['temperature'],
+    }
+    if tools:
+        body['tools'] = tools
+
+    for attempt in range(cfg.get('max_retries', 3)):
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=cfg.get('timeout', 3600))
+            if resp.status_code == 200:
+                data = resp.json()
+                choice = data['choices'][0]
+                return choice['message'], choice.get('finish_reason', 'stop')
+            else:
+                print(f"[Venus] HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"[Venus] 请求异常: {e}")
+
+    return None, 'error'
 
 
 # -- Agent loop with nag reminder injection --
 def agent_loop(messages: list):
     rounds_since_todo = 0
     while True:
-        # Nag reminder is injected below, alongside tool results
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        # 构建带 system 消息的完整消息列表
+        full_messages = [{"role": "system", "content": SYSTEM}] + messages
+
+        # 调用 Venus API
+        assistant_msg, finish_reason = call_venus_with_tools(full_messages, TOOLS)
+
+        if assistant_msg is None:
+            print("\033[31m[Error] API 调用失败\033[0m")
             return
-        results = []
+
+        # 将 assistant 回复加入历史
+        messages.append({"role": "assistant", "content": assistant_msg.get("content"),
+                         "tool_calls": assistant_msg.get("tool_calls")})
+
+        # 如果模型没有调用工具，结束循环
+        tool_calls = assistant_msg.get("tool_calls")
+        if not tool_calls:
+            return
+
+        # 执行每个工具调用，收集结果
         used_todo = False
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-                if block.name == "todo":
-                    used_todo = True
+        for tool_call in tool_calls:
+            func = tool_call["function"]
+            func_name = func["name"]
+            try:
+                args = json.loads(func["arguments"])
+            except json.JSONDecodeError:
+                args = {"command": func["arguments"]}
+
+            handler = TOOL_HANDLERS.get(func_name)
+            try:
+                output = handler(**args) if handler else f"Unknown tool: {func_name}"
+            except Exception as e:
+                output = f"Error: {e}"
+
+            print(f"\033[33m> {func_name}: {str(output)[:200]}\033[0m")
+
+            if func_name == "todo":
+                used_todo = True
+
+            # OpenAI 格式：tool 角色的消息
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": str(output),
+            })
+
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+
+        # Nag reminder: 连续3轮没更新 todo，注入提醒
         if rounds_since_todo >= 3:
-            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
-        messages.append({"role": "user", "content": results})
+            messages.append({"role": "user", "content": "<reminder>Update your todos.</reminder>"})
 
 
 if __name__ == "__main__":
@@ -202,9 +277,11 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+
+        # 打印最后一条 assistant 回复
+        if history and history[-1].get("role") == "assistant":
+            content = history[-1].get("content")
+            if content:
+                print(content)
         print()
+

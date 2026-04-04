@@ -14,8 +14,8 @@ load_dotenv(override=True)
 # ==================== 从 .env 读取配置 ====================
 VENUS_CONFIG = {
     'model_url': os.getenv('VENUS_BASE_URL', 'http://v2.open.venus.oa.com/llmproxy/chat/completions'),
-    'model_name': os.getenv('VENUS_MODEL_glm4.7', 'kimi-k2-instruct-local'),
-    'api_key': os.getenv('VENUS_API_KEY', ''),
+    'model_name': os.getenv('VENUS_MODEL_glm5', 'kimi-k2-instruct-local'),
+    'api_key': os.getenv('VENUS_API_KEY_liangbo', ''),
     'auth_type': 'Bearer',
     'timeout': 3600,
     'max_retries': 3,
@@ -65,15 +65,15 @@ def call_venus(messages, config=None, temperature=None):
 
 # ==================== 快速测试 ====================
 if __name__ == "__main__":
-    result = call_venus([
-        {"role": "system", "content": "你是一个有用的助手。"},
-        {"role": "user", "content": "你好，请用一句话介绍你自己。"},
-    ])
-    print(f"回复: {result}")
+    # result = call_venus([
+    #     {"role": "system", "content": "你是一个有用的助手。"},
+    #     {"role": "user", "content": "你好，请用一句话介绍你自己。"},
+    # ])
+    # print(f"回复: {result}")
 
 
-    # # 测试.env文件
-    # from dotenv import load_dotenv
-    # load_dotenv(override=True)
-    # print(os.getenv('VENUS_API_KEY'))
-    # print(os.getenv('NAME'))
+    # 测试.env文件
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+    print(os.getenv('VENUS_API_KEY_liangbo'))
+    print(os.getenv('NAME'))
