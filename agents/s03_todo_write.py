@@ -83,7 +83,7 @@ class TodoManager:
             return "No todos."
         lines = []
         for item in self.items:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            marker = {"pending": "[待办]", "in_progress": "[进行中]", "completed": "[已完成]"}[item["status"]]
             lines.append(f"{marker} #{item['id']}: {item['text']}")
         done = sum(1 for t in self.items if t["status"] == "completed")
         lines.append(f"\n({done}/{len(self.items)} completed)")
@@ -105,16 +105,21 @@ def run_bash(command: str) -> str:
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
+        # Windows 下 cmd 输出为 GBK 编码，优先尝试 GBK 解码，失败则回退 UTF-8
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+                           capture_output=True, timeout=120)
+        raw = r.stdout + r.stderr
+        try:
+            out = raw.decode("gbk").strip()
+        except (UnicodeDecodeError, AttributeError):
+            out = raw.decode("utf-8", errors="replace").strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
 def run_read(path: str, limit: int = None) -> str:
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path).read_text(encoding="utf-8", errors="replace").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
         return "\n".join(lines)[:50000]
@@ -247,7 +252,7 @@ def agent_loop(messages: list):
             except Exception as e:
                 output = f"Error: {e}"
 
-            print(f"\033[33m> {func_name}: {str(output)[:200]}\033[0m")
+            print(f"\033[33m> {func_name}: {str(output)[:1000]}\033[0m")
 
             if func_name == "todo":
                 used_todo = True
@@ -284,4 +289,6 @@ if __name__ == "__main__":
             if content:
                 print(content)
         print()
+
+        # 帮我看看我们现在在什么目录，然后帮我总结一下GH_try.py这个文件的内容。必须要使用todo 这个工具
 
