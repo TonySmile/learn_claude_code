@@ -45,20 +45,24 @@ isolated tool context -- same pattern as this teaching implementation.
 
 import os
 import re
+import sys
+import json
 import subprocess
 from pathlib import Path
 
-from anthropic import Anthropic
+import requests
 from dotenv import load_dotenv
+
+from rich import print
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+# 将项目根目录加入 sys.path，以便导入 llm 模块
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from llm.venus_client import VENUS_CONFIG
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
@@ -153,71 +157,167 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
-# Child gets all base tools except task (no recursive spawning)
+# Child gets all base tools except task (no recursive spawning) -- OpenAI 格式
 CHILD_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    {"type": "function", "function": {
+        "name": "bash", "description": "Run a shell command.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read file contents.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+
+    {"type": "function", "function": {
+        "name": "write_file", "description": "Write content to file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+
+    {"type": "function", "function": {
+        "name": "edit_file", "description": "Replace exact text in file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
 ]
+
+
+def call_venus_with_tools(messages, system_prompt, tools=None):
+    """
+    调用 Venus API（OpenAI 格式），支持工具调用。
+    返回完整的 response message 字典。
+    """
+    cfg = VENUS_CONFIG
+    url = cfg['model_url']
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f"{cfg['auth_type']} {cfg['api_key']}",
+    }
+    full_messages = [{"role": "system", "content": system_prompt}] + messages
+    body = {
+        'model': cfg['model_name'],
+        'messages': full_messages,
+        'temperature': cfg['temperature'],
+    }
+    if tools:
+        body['tools'] = tools
+
+    for attempt in range(cfg.get('max_retries', 3)):
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=cfg.get('timeout', 3600))
+            if resp.status_code == 200:
+                data = resp.json()
+                choice = data['choices'][0]
+                return choice['message'], choice.get('finish_reason', 'stop')
+            else:
+                print(f"[Venus] HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"[Venus] 请求异常: {e}")
+
+    return None, 'error'
 
 
 # -- Subagent: fresh context, filtered tools, summary-only return --
 def run_subagent(prompt: str) -> str:
     sub_messages = [{"role": "user", "content": prompt}]  # fresh context
     for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
-            tools=CHILD_TOOLS, max_tokens=8000,
-        )
-        sub_messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        assistant_msg, finish_reason = call_venus_with_tools(sub_messages, SUBAGENT_SYSTEM, CHILD_TOOLS)
+
+        if assistant_msg is None:
+            return "(subagent API error)"
+
+        # 将 assistant 回复加入历史
+        sub_messages.append({"role": "assistant", "content": assistant_msg.get("content"),
+                             "tool_calls": assistant_msg.get("tool_calls")})
+
+        # 如果模型没有调用工具，结束循环
+        tool_calls = assistant_msg.get("tool_calls")
+        if not tool_calls:
             break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
+
+        # 执行每个工具调用，收集结果
+        for tool_call in tool_calls:
+            func = tool_call["function"]
+            func_name = func["name"]
+            try:
+                args = json.loads(func["arguments"])
+            except json.JSONDecodeError:
+                args = {"command": func["arguments"]}
+
+            handler = TOOL_HANDLERS.get(func_name)
+            if handler:
+                print(f"\033[33m  [subagent] > {func_name}: {json.dumps(args, ensure_ascii=False)[:200]}\033[0m")
+                output = handler(**args)
+                print(f"  {str(output)[:200]}")
+            else:
+                output = f"Unknown tool: {func_name}"
+
+            # OpenAI 格式：tool 角色的消息
+            sub_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": str(output)[:50000],
+            })
+
     # Only the final text returns to the parent -- child context is discarded
-    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+    last_assistant = sub_messages[-1] if sub_messages else {}
+    if last_assistant.get("role") == "assistant" and last_assistant.get("content"):
+        return last_assistant["content"]
+    return "(no summary)"
 
 
 # -- Parent tools: base tools + task dispatcher --
+# 实际上这里就是：
+# 父工具 = 子工具 + 一个task工具
 PARENT_TOOLS = CHILD_TOOLS + [
-    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
+    {"type": "function", "function": {
+        "name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+        "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}}},
 ]
 
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=PARENT_TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        assistant_msg, finish_reason = call_venus_with_tools(messages, SYSTEM, PARENT_TOOLS)
+
+        if assistant_msg is None:
+            print("\033[31m[Error] API 调用失败\033[0m")
             return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subtask")
-                    prompt = block.input.get("prompt", "")
-                    print(f"> task ({desc}): {prompt[:80]}")
-                    output = run_subagent(prompt)
+
+        # 将 assistant 回复加入历史
+        messages.append({"role": "assistant", "content": assistant_msg.get("content"),
+                         "tool_calls": assistant_msg.get("tool_calls")})
+
+        # 如果模型没有调用工具，结束循环
+        tool_calls = assistant_msg.ge ("tool_calls")
+        if not tool_calls:
+            return
+
+        # 执行每个工具调用，收集结果
+        for tool_call in tool_calls:
+            func = tool_call["function"]
+            func_name = func["name"]
+            try:
+                args = json.loads(func["arguments"])
+            except json.JSONDecodeError:
+                args = {"command": func["arguments"]}
+
+            if func_name == "task":
+                desc = args.get("description", "subtask")
+                prompt = args.get("prompt", "")
+                print(f"> task ({desc}): {prompt[:80]}")
+                output = run_subagent(prompt)
+            else:
+                handler = TOOL_HANDLERS.get(func_name)
+                if handler:
+                    print(f"\033[33m> {func_name}: {json.dumps(args, ensure_ascii=False)[:200]}\033[0m")
+                    output = handler(**args)
                 else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+                    output = f"Unknown tool: {func_name}"
+
+            print(f"  {str(output)[:200]}")
+
+            # OpenAI 格式：tool 角色的消息
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": str(output),
+            })
 
 
 if __name__ == "__main__":
@@ -231,9 +331,10 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+
+        # 打印最后一条 assistant 回复
+        if history and history[-1].get("role") == "assistant":
+            content = history[-1].get("content")
+            if content:
+                print(content)
         print()
