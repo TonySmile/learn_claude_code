@@ -1,45 +1,44 @@
 #!/usr/bin/env python3
-# Harness: context isolation -- protecting the model's clarity of thought.
+# 核心机制：上下文隔离 -- 保护模型的思维清晰度
 """
-s04_subagent.py - Subagents
+s04_subagent.py - 子代理
 
-Spawn a child agent with fresh messages=[]. The child works in its own
-context, sharing the filesystem, then returns only a summary to the parent.
+生成一个拥有全新 messages=[] 的子代理。子代理在自己的上下文中工作，
+与父代理共享文件系统，最终只返回摘要给父代理。
 
-    Parent agent                     Subagent
+    父代理 (Parent)                   子代理 (Subagent)
     +------------------+             +------------------+
-    | messages=[...]   |             | messages=[]      |  <-- fresh
-    |                  |  dispatch   |                  |
-    | tool: task       | ---------->| while tool_use:  |
-    |   prompt="..."   |            |   call tools     |
-    |   description="" |            |   append results |
-    |                  |  summary   |                  |
-    |   result = "..." | <--------- | return last text |
+    | messages=[...]   |             | messages=[]      |  <-- 全新上下文
+    |                  |  分发任务    |                  |
+    | tool: task       | ---------->| while 工具调用:   |
+    |   prompt="..."   |            |   调用工具        |
+    |   description="" |            |   追加结果        |
+    |                  |  返回摘要   |                  |
+    |   result = "..." | <--------- | 返回最终文本      |
     +------------------+             +------------------+
               |
-    Parent context stays clean.
-    Subagent context is discarded.
+    父代理上下文保持干净。
+    子代理上下文被丢弃。
 
-Key insight: "Fresh messages=[] gives context isolation. The parent stays clean."
+核心洞察："全新的 messages=[] 实现了上下文隔离，父代理保持干净。"
 
-Note: Real Claude Code also uses in-process isolation (not OS-level process
-forking). The child runs in the same process with a fresh message array and
-isolated tool context -- same pattern as this teaching implementation.
+注意：真正的 Claude Code 也使用进程内隔离（而非操作系统级别的进程 fork）。
+子代理在同一进程中运行，拥有全新的消息数组和隔离的工具上下文 -- 与本教学实现相同的模式。
 
-    Comparison with real Claude Code:
+    与真正的 Claude Code 对比：
     +-------------------+------------------+----------------------------------+
-    | Aspect            | This demo        | Real Claude Code                 |
+    | 方面              | 本 demo          | 真正的 Claude Code               |
     +-------------------+------------------+----------------------------------+
-    | Backend           | in-process only  | 5 backends: in-process, tmux,    |
+    | 后端              | 仅进程内         | 5种后端: 进程内, tmux,            |
     |                   |                  | iTerm2, fork, remote             |
-    | Context isolation | fresh messages=[]| createSubagentContext() isolates  |
-    |                   |                  | ~20 fields (tools, permissions,  |
-    |                   |                  | cwd, env, hooks, etc.)           |
-    | Tool filtering    | manually curated | resolveAgentTools() filters from |
-    |                   |                  | parent pool; allowedTools         |
-    |                   |                  | replaces all allow rules         |
-    | Agent definition  | hardcoded system | .claude/agents/*.md with YAML    |
-    |                   | prompt           | frontmatter (AgentTemplate)      |
+    | 上下文隔离        | 全新 messages=[] | createSubagentContext() 隔离     |
+    |                   |                  | ~20个字段 (工具、权限、          |
+    |                   |                  | 工作目录、环境变量、钩子等)      |
+    | 工具过滤          | 手动筛选         | resolveAgentTools() 从父代理     |
+    |                   |                  | 工具池中过滤; allowedTools       |
+    |                   |                  | 替换所有允许规则                 |
+    | 代理定义          | 硬编码系统提示词 | .claude/agents/*.md 带 YAML      |
+    |                   |                  | frontmatter (AgentTemplate)      |
     +-------------------+------------------+----------------------------------+
 """
 
@@ -64,19 +63,47 @@ from llm.venus_client import VENUS_CONFIG
 
 WORKDIR = Path.cwd()
 
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
-SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+SYSTEM = f"""你是一个位于 {WORKDIR} 的编程代理。你是一个**指挥官**，不是执行者。
+
+关于 `task` 工具的重要规则：
+1. 你必须使用 `task` 工具来委派以下任何操作：
+   - 读取或浏览文件和目录
+   - 运行 shell 命令（ls、find、grep、git 等）
+   - 分析代码结构或内容
+   - 写入或编辑文件
+   - 任何涉及文件系统交互的操作
+
+2. 你绝对不能自己直接调用 bash、read_file、write_file 或 edit_file。
+   必须始终通过 `task` 调用来委派给子代理执行。
+
+3. 你的职责是：
+   - 理解用户的请求
+   - 将请求拆分为一个或多个子任务
+   - 通过 `task` 工具委派每个子任务
+   - 将子代理返回的结果整合为连贯的回复
+
+4. 简单请求用一个 task 调用，复杂请求用多个 task 调用。
+
+示例：如果用户问"这个项目有哪些文件？"，你应该调用：
+  task(prompt="递归列出当前目录下的所有文件，并总结项目结构。", description="探索项目结构")
+
+绝对不要直接执行工具。始终通过 `task` 委派。
+"""
+
+SUBAGENT_SYSTEM = f"""你是一个位于 {WORKDIR} 的编程子代理。你可以使用 bash、read_file、write_file 和 edit_file 工具。
+请使用这些工具彻底完成给定的任务，然后提供一份清晰的发现和操作摘要。
+摘要要简洁但完整。"""
 
 
 class AgentTemplate:
     """
-    Parse agent definition from markdown frontmatter.
+    从 Markdown frontmatter 解析代理定义。
 
-    Real Claude Code loads agent definitions from .claude/agents/*.md.
-    Frontmatter fields: name, tools, disallowedTools, skills, hooks,
+    真正的 Claude Code 从 .claude/agents/*.md 加载代理定义。
+    Frontmatter 字段：name, tools, disallowedTools, skills, hooks,
     model, effort, permissionMode, maxTurns, memory, isolation, color,
-    background, initialPrompt, mcpServers.
-    3 sources: built-in, custom (.claude/agents/), plugin-provided.
+    background, initialPrompt, mcpServers。
+    3种来源：内置的、自定义的(.claude/agents/)、插件提供的。
     """
     def __init__(self, path):
         self.path = Path(path)
@@ -99,7 +126,7 @@ class AgentTemplate:
         self.name = self.config.get("name", self.name)
 
 
-# -- Tool implementations shared by parent and child --
+# -- 父代理和子代理共享的工具实现 --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -107,6 +134,7 @@ def safe_path(p: str) -> Path:
     return path
 
 def run_bash(command: str) -> str:
+    # 危险命令黑名单
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -157,31 +185,28 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
-# Child gets all base tools except task (no recursive spawning) -- OpenAI 格式
+# 子代理拥有所有基础工具，但没有 task 工具（防止递归生成子代理）-- OpenAI 格式
 CHILD_TOOLS = [
     {"type": "function", "function": {
-        "name": "bash", "description": "Run a shell command.",
+        "name": "bash", "description": "运行 shell 命令。",
         "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
 
     {"type": "function", "function": {
-        "name": "read_file", "description": "Read file contents.",
+        "name": "read_file", "description": "读取文件内容。",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
 
     {"type": "function", "function": {
-        "name": "write_file", "description": "Write content to file.",
+        "name": "write_file", "description": "将内容写入文件。",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
 
     {"type": "function", "function": {
-        "name": "edit_file", "description": "Replace exact text in file.",
+        "name": "edit_file", "description": "替换文件中的精确文本。",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
 ]
 
 
 def call_venus_with_tools(messages, system_prompt, tools=None):
-    """
-    调用 Venus API（OpenAI 格式），支持工具调用。
-    返回完整的 response message 字典。
-    """
+    """调用 Venus API（OpenAI 格式），支持工具调用。返回完整的 response message 字典。"""
     cfg = VENUS_CONFIG
     url = cfg['model_url']
     headers = {
@@ -212,16 +237,16 @@ def call_venus_with_tools(messages, system_prompt, tools=None):
     return None, 'error'
 
 
-# -- Subagent: fresh context, filtered tools, summary-only return --
+# -- 子代理：全新上下文、过滤后的工具、仅返回摘要 --
 def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
-    for _ in range(30):  # safety limit
+    sub_messages = [{"role": "user", "content": prompt}]  # 全新上下文
+    for _ in range(30):  # 安全上限
         assistant_msg, finish_reason = call_venus_with_tools(sub_messages, SUBAGENT_SYSTEM, CHILD_TOOLS)
 
         if assistant_msg is None:
-            return "(subagent API error)"
+            return "(子代理 API 调用失败)"
 
-        # 将 assistant 回复加入历史
+        # 将 assistant 回复加入子代理历史
         sub_messages.append({"role": "assistant", "content": assistant_msg.get("content"),
                              "tool_calls": assistant_msg.get("tool_calls")})
 
@@ -230,7 +255,7 @@ def run_subagent(prompt: str) -> str:
         if not tool_calls:
             break
 
-        # 执行每个工具调用，收集结果
+        # 逐个执行工具调用，收集结果
         for tool_call in tool_calls:
             func = tool_call["function"]
             func_name = func["name"]
@@ -254,20 +279,20 @@ def run_subagent(prompt: str) -> str:
                 "content": str(output)[:50000],
             })
 
-    # Only the final text returns to the parent -- child context is discarded
+    # 只有最终文本返回给父代理 -- 子代理上下文被丢弃
     last_assistant = sub_messages[-1] if sub_messages else {}
     if last_assistant.get("role") == "assistant" and last_assistant.get("content"):
         return last_assistant["content"]
-    return "(no summary)"
+    return "(无摘要)"
 
 
-# -- Parent tools: base tools + task dispatcher --
+# -- 父代理工具：基础工具 + task 任务分发器 --
 # 实际上这里就是：
-# 父工具 = 子工具 + 一个task工具
+# 父工具 = 子工具 + 一个 task 工具
 PARENT_TOOLS = CHILD_TOOLS + [
     {"type": "function", "function": {
-        "name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-        "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}}},
+        "name": "task", "description": "生成一个拥有全新上下文的子代理。子代理与父代理共享文件系统，但不共享对话历史。",
+        "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "要委派给子代理的任务描述"}, "description": {"type": "string", "description": "任务的简短描述"}}, "required": ["prompt"]}}},
 ]
 
 
@@ -276,19 +301,19 @@ def agent_loop(messages: list):
         assistant_msg, finish_reason = call_venus_with_tools(messages, SYSTEM, PARENT_TOOLS)
 
         if assistant_msg is None:
-            print("\033[31m[Error] API 调用失败\033[0m")
+            print("\033[31m[错误] API 调用失败\033[0m")
             return
 
-        # 将 assistant 回复加入历史
+        # 将 assistant 回复加入父代理历史
         messages.append({"role": "assistant", "content": assistant_msg.get("content"),
                          "tool_calls": assistant_msg.get("tool_calls")})
 
         # 如果模型没有调用工具，结束循环
-        tool_calls = assistant_msg.ge ("tool_calls")
+        tool_calls = assistant_msg.get("tool_calls")
         if not tool_calls:
             return
 
-        # 执行每个工具调用，收集结果
+        # 逐个执行工具调用，收集结果
         for tool_call in tool_calls:
             func = tool_call["function"]
             func_name = func["name"]
@@ -298,9 +323,9 @@ def agent_loop(messages: list):
                 args = {"command": func["arguments"]}
 
             if func_name == "task":
-                desc = args.get("description", "subtask")
+                desc = args.get("description", "子任务")
                 prompt = args.get("prompt", "")
-                print(f"> task ({desc}): {prompt[:80]}")
+                print(f"\033[35m> 委派子任务 ({desc}): {prompt[:80]}\033[0m")
                 output = run_subagent(prompt)
             else:
                 handler = TOOL_HANDLERS.get(func_name)
@@ -332,7 +357,7 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         agent_loop(history)
 
-        # 打印最后一条 assistant 回复
+            # 打印最后一条 assistant 回复（父代理的最终整合结果）
         if history and history[-1].get("role") == "assistant":
             content = history[-1].get("content")
             if content:
