@@ -49,7 +49,6 @@ import json
 import subprocess
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 
 from rich import print
@@ -59,7 +58,7 @@ load_dotenv(override=True)
 # 将项目根目录加入 sys.path，以便导入 llm 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from llm.venus_client import VENUS_CONFIG
+from llm.router import call_llm_with_tools
 
 WORKDIR = Path.cwd()
 
@@ -205,43 +204,17 @@ CHILD_TOOLS = [
 ]
 
 
-def call_venus_with_tools(messages, system_prompt, tools=None):
-    """调用 Venus API（OpenAI 格式），支持工具调用。返回完整的 response message 字典。"""
-    cfg = VENUS_CONFIG
-    url = cfg['model_url']
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f"{cfg['auth_type']} {cfg['api_key']}",
-    }
+def _call_with_system(messages, system_prompt, tools=None):
+    """在 messages 前拼接 system 消息，然后调用统一的 call_llm_with_tools。"""
     full_messages = [{"role": "system", "content": system_prompt}] + messages
-    body = {
-        'model': cfg['model_name'],
-        'messages': full_messages,
-        'temperature': cfg['temperature'],
-    }
-    if tools:
-        body['tools'] = tools
-
-    for attempt in range(cfg.get('max_retries', 3)):
-        try:
-            resp = requests.post(url, headers=headers, json=body, timeout=cfg.get('timeout', 3600))
-            if resp.status_code == 200:
-                data = resp.json()
-                choice = data['choices'][0]
-                return choice['message'], choice.get('finish_reason', 'stop')
-            else:
-                print(f"[Venus] HTTP {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            print(f"[Venus] 请求异常: {e}")
-
-    return None, 'error'
+    return call_llm_with_tools(full_messages, tools=tools)
 
 
 # -- 子代理：全新上下文、过滤后的工具、仅返回摘要 --
 def run_subagent(prompt: str) -> str:
     sub_messages = [{"role": "user", "content": prompt}]  # 全新上下文
     for _ in range(30):  # 安全上限
-        assistant_msg, finish_reason = call_venus_with_tools(sub_messages, SUBAGENT_SYSTEM, CHILD_TOOLS)
+        assistant_msg, finish_reason = _call_with_system(sub_messages, SUBAGENT_SYSTEM, CHILD_TOOLS)
 
         if assistant_msg is None:
             return "(子代理 API 调用失败)"
@@ -298,7 +271,7 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 def agent_loop(messages: list):
     while True:
-        assistant_msg, finish_reason = call_venus_with_tools(messages, SYSTEM, PARENT_TOOLS)
+        assistant_msg, finish_reason = _call_with_system(messages, SYSTEM, PARENT_TOOLS)
 
         if assistant_msg is None:
             print("\033[31m[错误] API 调用失败\033[0m")

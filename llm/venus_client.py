@@ -23,12 +23,13 @@ VENUS_CONFIG = {
 }
 
 
-def call_venus(messages, config=None, temperature=None):
+def call_venus(messages, model=None, config=None, temperature=None):
     """
     调用 Venus API，返回模型回复内容（字符串）
 
     Args:
         messages: OpenAI 格式的消息列表，如 [{"role": "user", "content": "你好"}]
+        model: 可选，指定模型名称（如 'glm-5'、'kimi-k2-instruct-local'），传了就用传的，没传就用 config 里的默认值
         config: 可选，自定义配置（默认用 VENUS_CONFIG）
         temperature: 可选，覆盖配置中的温度参数
 
@@ -42,7 +43,7 @@ def call_venus(messages, config=None, temperature=None):
         'Authorization': f"{cfg['auth_type']} {cfg['api_key']}",
     }
     body = {
-        'model': cfg['model_name'],
+        'model': model or cfg['model_name'],  # 优先用手动传入的 model，没传就用配置里的默认值
         'messages': messages,
         'temperature': temperature if temperature is not None else cfg['temperature'],
     }

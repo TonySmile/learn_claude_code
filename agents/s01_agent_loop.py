@@ -29,7 +29,6 @@ import sys
 import json
 import subprocess
 
-import requests
 from dotenv import load_dotenv
 
 from rich import print
@@ -39,7 +38,7 @@ load_dotenv(override=True)
 # 将项目根目录加入 sys.path，以便导入 llm 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from llm.venus_client import VENUS_CONFIG
+from llm.router import call_llm_with_tools
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
@@ -71,40 +70,6 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 
-def call_venus_with_tools(messages, tools=None):
-    """
-    调用 Venus API（OpenAI 格式），支持工具调用。
-    返回完整的 response message 字典。
-    """
-    cfg = VENUS_CONFIG
-    url = cfg['model_url']
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f"{cfg['auth_type']} {cfg['api_key']}",
-    }
-    body = {
-        'model': cfg['model_name'],
-        'messages': messages,
-        'temperature': cfg['temperature'],
-    }
-    if tools:
-        body['tools'] = tools
-
-    for attempt in range(cfg.get('max_retries', 3)):
-        try:
-            resp = requests.post(url, headers=headers, json=body, timeout=cfg.get('timeout', 3600))
-            if resp.status_code == 200:
-                data = resp.json()
-                choice = data['choices'][0]
-                return choice['message'], choice.get('finish_reason', 'stop')
-            else:
-                print(f"[Venus] HTTP {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            print(f"[Venus] 请求异常: {e}")
-
-    return None, 'error'
-
-
 # -- 核心模式：一个 while 循环，不断调用工具直到模型停止 --
 def agent_loop(messages: list):
     while True:
@@ -114,7 +79,7 @@ def agent_loop(messages: list):
         # print('当前信息{}'.format(messages))
         # print('历史信息{}'.format(full_messages))
 
-        assistant_msg, finish_reason = call_venus_with_tools(full_messages, TOOLS)
+        assistant_msg, finish_reason = call_llm_with_tools(full_messages, TOOLS)
 
         if assistant_msg is None:
             print("\033[31m[Error] API 调用失败\033[0m")
